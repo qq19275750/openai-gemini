@@ -275,7 +275,7 @@ const parseImg = async (url) => {
   } else {
     const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
     if (!match) {
-      throw new Error("Invalid image data: " + url);
+      throw new HttpError("Invalid image data: " + url, 400);
     }
     ({ mimeType, data } = match.groups);
   }
@@ -287,13 +287,13 @@ const parseImg = async (url) => {
   };
 };
 
-const transformMsg = async ({ role, content }) => {
+const transformMsg = async ({ content }) => {
   const parts = [];
   if (!Array.isArray(content)) {
     // system, user: string
     // assistant: string or null (Required unless tool_calls is specified.)
     parts.push({ text: content });
-    return { role, parts };
+    return parts;
   }
   // user:
   // An array of content parts with a defined type.
@@ -316,13 +316,13 @@ const transformMsg = async ({ role, content }) => {
         });
         break;
       default:
-        throw new TypeError(`Unknown "content" item type: "${item.type}"`);
+        throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400);
     }
   }
   if (content.every(item => item.type === "image_url")) {
     parts.push({ text: "" }); // to avoid "Unable to submit request because it must have a text parameter"
   }
-  return { role, parts };
+  return parts;
 };
 
 const transformMessages = async (messages) => {
@@ -331,11 +331,17 @@ const transformMessages = async (messages) => {
   let system_instruction;
   for (const item of messages) {
     if (item.role === "system") {
-      delete item.role;
-      system_instruction = await transformMsg(item);
+      system_instruction = { parts: await transformMsg(item) };
     } else {
-      item.role = item.role === "assistant" ? "model" : "user";
-      contents.push(await transformMsg(item));
+      if (item.role === "assistant") {
+        item.role = "model";
+      } else if (item.role !== "user") {
+        throw HttpError(`Unknown message role: "${item.role}"`, 400);
+      }
+      contents.push({
+        role: item.role,
+        parts: await transformMsg(item, fnames)
+      });
     }
   }
   if (system_instruction && contents.length === 0) {
@@ -367,14 +373,19 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   // :"function_call",
 };
 const SEP = "\n\n|>";
-const transformCandidates = (key, cand) => ({
-  index: cand.index || 0, // 0-index is absent in new -002 models response
-  [key]: {
-    role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
-  logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
-});
+const transformCandidates = (key, cand) => {
+  const message = { role: "assistant", content: [] };
+  for (const part of cand.content?.parts ?? []) {
+    message.content.push(part.text);
+  }
+  message.content = message.content.join(SEP) || null;
+  return {
+    index: cand.index || 0, // 0-index is absent in new -002 models response
+    [key]: message,
+    logprobs: null,
+    finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+  };
+};
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
@@ -415,10 +426,19 @@ async function parseStreamFlush (controller) {
   }
 }
 
-function transformResponseStream (data, stop, first) {
+function transformResponseStream (data, special) {
   const item = transformCandidatesDelta(data.candidates[0]);
-  if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+  switch (special) {
+    case "stop":
+      item.delta = {};
+      break;
+    case "first":
+      item.delta.content = "";
+      // eslint-disable-next-line no-fallthrough
+    default:
+      delete item.delta.role;
+      item.finish_reason = null;
+  }
   const output = {
     id: this.id,
     choices: [item],
@@ -455,7 +475,7 @@ async function toOpenAiStream (chunk, controller) {
   console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   cand.index = cand.index || 0; // absent in new -002 models response
   if (!this.last[cand.index]) {
-    controller.enqueue(transform(data, false, "first"));
+    controller.enqueue(transform(data, "first"));
   }
   this.last[cand.index] = data;
   if (cand.content) { // prevent empty data (e.g. when MAX_TOKENS)
